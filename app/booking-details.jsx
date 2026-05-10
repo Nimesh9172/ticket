@@ -1,7 +1,14 @@
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   ImageBackground,
   Pressable,
@@ -12,17 +19,19 @@ import {
 } from "react-native";
 import QRCode from "react-native-qrcode-svg";
 import Animated, {
+  cancelAnimation,
   Easing,
+  runOnJS,
   useAnimatedStyle,
   useSharedValue,
   withTiming,
 } from "react-native-reanimated";
 import { SafeAreaView } from "react-native-safe-area-context";
 
-const PAGE_BACKGROUND = "#F4E5E1";
+const PAGE_BACKGROUND = "#D3D3D3";
 const TICKET_PAPER = "#FBF5F2";
 const TICKET_GREEN = "#B8F18E";
-const NOTCH_FILL = "#EFDCD8";
+const NOTCH_FILL = "#D3D3D3";
 
 const QR_SEASON_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const QR_SEASON_DIGITS = "0123456789";
@@ -41,9 +50,7 @@ function generateSeasonTicketId() {
       );
     } else {
       suffix.push(
-        QR_SEASON_LETTERS[
-          Math.floor(Math.random() * QR_SEASON_LETTERS.length)
-        ],
+        QR_SEASON_LETTERS[Math.floor(Math.random() * QR_SEASON_LETTERS.length)],
       );
     }
   }
@@ -60,9 +67,20 @@ function buildQrPayload(seasonId) {
 /** Initial preview countdown (displayed as 04:59). */
 const PREVIEW_DURATION_SEC = 4 * 60 + 59;
 
-/** Preview timer digit: enters from fully above the slot, then settles. */
-const TIMER_FROM_TOP_DURATION_MS = 420;
-const TIMER_FROM_TOP_OFFSET_Y = -56;
+const TIMER_DIGIT_HEIGHT = 56;
+const TIMER_DIGIT_WIDTH = 30;
+const TIMER_ROLL_DURATION_MS = 430;
+const TIMER_ROLL_START_Y = -TIMER_DIGIT_HEIGHT;
+const TIMER_ROLL_EXIT_Y = TIMER_DIGIT_HEIGHT;
+
+const TIMER_ROLL_TIMING = {
+  duration: TIMER_ROLL_DURATION_MS,
+  easing: Easing.out(Easing.cubic),
+};
+const TIMER_ROLL_FADE = {
+  duration: TIMER_ROLL_DURATION_MS,
+  easing: Easing.out(Easing.quad),
+};
 
 function getMmSsParts(totalSeconds) {
   const clamped = Math.max(0, totalSeconds);
@@ -134,25 +152,99 @@ function addCalendarDays(d, deltaDays) {
   return x;
 }
 
-export default function BookingDetails() {
-  const router = useRouter();
+/**
+ * Owns countdown state so the booking screen doesn't re-render every second
+ * (avoids jitter from layout + QR + ScrollView subtree).
+ */
+const RollingTimerDigit = memo(function RollingTimerDigit({
+  value,
+  rollTrigger,
+}) {
+  const previousValueRef = useRef(value);
+  const previousTriggerRef = useRef(rollTrigger);
+  const rollIdRef = useRef(0);
+  const [roll, setRoll] = useState(null);
+
+  const outgoingY = useSharedValue(0);
+  const outgoingOpacity = useSharedValue(1);
+  const incomingY = useSharedValue(0);
+  const incomingOpacity = useSharedValue(1);
+
+  const outgoingStyle = useAnimatedStyle(() => ({
+    opacity: outgoingOpacity.value,
+    transform: [{ translateY: outgoingY.value }],
+  }));
+  const incomingStyle = useAnimatedStyle(() => ({
+    opacity: incomingOpacity.value,
+    transform: [{ translateY: incomingY.value }],
+  }));
+
+  useLayoutEffect(() => {
+    if (previousTriggerRef.current === rollTrigger) return;
+    rollIdRef.current += 1;
+    setRoll({
+      id: rollIdRef.current,
+      from: previousValueRef.current,
+      to: value,
+    });
+    previousValueRef.current = value;
+    previousTriggerRef.current = rollTrigger;
+  }, [rollTrigger, value]);
+
+  useLayoutEffect(() => {
+    if (!roll) return;
+
+    cancelAnimation(outgoingY);
+    cancelAnimation(outgoingOpacity);
+    cancelAnimation(incomingY);
+    cancelAnimation(incomingOpacity);
+
+    outgoingY.value = 0;
+    outgoingOpacity.value = 1;
+    incomingY.value = TIMER_ROLL_START_Y;
+    incomingOpacity.value = 0;
+
+    outgoingY.value = withTiming(TIMER_ROLL_EXIT_Y, TIMER_ROLL_TIMING);
+    outgoingOpacity.value = withTiming(0, TIMER_ROLL_FADE);
+    incomingY.value = withTiming(0, TIMER_ROLL_TIMING);
+    incomingOpacity.value = withTiming(1, TIMER_ROLL_FADE, (finished) => {
+      if (finished) runOnJS(setRoll)(null);
+    });
+  }, [incomingOpacity, incomingY, outgoingOpacity, outgoingY, roll]);
+
+  return (
+    <View style={styles.previewTimerDigitSlot}>
+      {roll ? (
+        <>
+          <Animated.View
+            key={`out-${roll.id}`}
+            style={[styles.previewTimerDigitOverlay, outgoingStyle]}
+          >
+            <Text style={[styles.previewTimer, styles.previewTimerDigitText]}>
+              {roll.from}
+            </Text>
+          </Animated.View>
+          <Animated.View
+            key={`in-${roll.id}`}
+            style={[styles.previewTimerDigitOverlay, incomingStyle]}
+          >
+            <Text style={[styles.previewTimer, styles.previewTimerDigitText]}>
+              {roll.to}
+            </Text>
+          </Animated.View>
+        </>
+      ) : (
+        <Text style={[styles.previewTimer, styles.previewTimerDigitText]}>
+          {value}
+        </Text>
+      )}
+    </View>
+  );
+});
+
+const PreviewCountdownTimer = memo(function PreviewCountdownTimer() {
   const [previewSecondsLeft, setPreviewSecondsLeft] =
     useState(PREVIEW_DURATION_SEC);
-  const timerBumpSkipRef = useRef(true);
-  const prevTimerPartsRef = useRef({ mm: "", ss: "" });
-  const minTranslateY = useSharedValue(0);
-  const minOpacity = useSharedValue(1);
-  const secTranslateY = useSharedValue(0);
-  const secOpacity = useSharedValue(1);
-
-  const minutesAnimatedStyle = useAnimatedStyle(() => ({
-    opacity: minOpacity.value,
-    transform: [{ translateY: minTranslateY.value }],
-  }));
-  const secondsAnimatedStyle = useAnimatedStyle(() => ({
-    opacity: secOpacity.value,
-    transform: [{ translateY: secTranslateY.value }],
-  }));
 
   useEffect(() => {
     const id = setInterval(() => {
@@ -161,38 +253,23 @@ export default function BookingDetails() {
     return () => clearInterval(id);
   }, []);
 
-  useEffect(() => {
-    const { mm, ss } = getMmSsParts(previewSecondsLeft);
-    if (timerBumpSkipRef.current) {
-      timerBumpSkipRef.current = false;
-      prevTimerPartsRef.current = { mm, ss };
-      return;
-    }
-    const prev = prevTimerPartsRef.current;
-    const slide = {
-      duration: TIMER_FROM_TOP_DURATION_MS,
-      easing: Easing.out(Easing.cubic),
-    };
-    const fade = {
-      duration: TIMER_FROM_TOP_DURATION_MS,
-      easing: Easing.out(Easing.quad),
-    };
-    const bumpFromTop = (translateY, opacity) => {
-      translateY.value = TIMER_FROM_TOP_OFFSET_Y;
-      opacity.value = 0.2;
-      translateY.value = withTiming(0, slide);
-      opacity.value = withTiming(1, fade);
-    };
-    if (mm !== prev.mm) {
-      bumpFromTop(minTranslateY, minOpacity);
-    }
-    if (ss !== prev.ss) {
-      bumpFromTop(secTranslateY, secOpacity);
-    }
-    prevTimerPartsRef.current = { mm, ss };
-  }, [previewSecondsLeft]);
-
   const { mm: timerMm, ss: timerSs } = getMmSsParts(previewSecondsLeft);
+
+  return (
+    <View style={styles.previewTimerWrap}>
+      <View style={styles.previewTimerRow}>
+        <RollingTimerDigit value={timerMm[0]} rollTrigger={timerMm} />
+        <RollingTimerDigit value={timerMm[1]} rollTrigger={timerMm} />
+        <Text style={styles.previewTimerColon}>:</Text>
+        <RollingTimerDigit value={timerSs[0]} rollTrigger={timerSs} />
+        <RollingTimerDigit value={timerSs[1]} rollTrigger={timerSs} />
+      </View>
+    </View>
+  );
+});
+
+export default function BookingDetails() {
+  const router = useRouter();
   const {
     previewBookingDateTime,
     bookedOnDateTime,
@@ -232,16 +309,25 @@ export default function BookingDetails() {
       >
         <View style={styles.header}>
           <View style={styles.headerRow}>
-            <Pressable onPress={handleBackPress} style={styles.backButton}>
+            <View style={styles.headerLeft}>
+              <Pressable onPress={handleBackPress} style={styles.backButton}>
+                <MaterialCommunityIcons
+                  name="arrow-left"
+                  color="#FFFFFF"
+                  size={20}
+                />
+              </Pressable>
+              <View>
+                <Text style={styles.headerTitle}>Booking Details</Text>
+                <Text style={styles.headerSubTitle}>Mobile: 7972861253</Text>
+              </View>
+            </View>
+            <View style={styles.shareButton}>
               <MaterialCommunityIcons
-                name="arrow-left"
+                name="share-variant"
                 color="#FFFFFF"
-                size={20}
+                size={23}
               />
-            </Pressable>
-            <View>
-              <Text style={styles.headerTitle}>Booking Details</Text>
-              <Text style={styles.headerSubTitle}>Mobile: 7972861253</Text>
             </View>
           </View>
         </View>
@@ -261,25 +347,7 @@ export default function BookingDetails() {
               <Text style={styles.dynamicPreview}>
                 Dymanic Preview will close in
               </Text>
-              <View style={styles.previewTimerWrap}>
-                <View style={styles.previewTimerRow}>
-                  <View style={styles.previewTimerSlot}>
-                    <Animated.Text
-                      style={[styles.previewTimer, minutesAnimatedStyle]}
-                    >
-                      {timerMm}
-                    </Animated.Text>
-                  </View>
-                  <Text style={styles.previewTimerColon}> : </Text>
-                  <View style={styles.previewTimerSlot}>
-                    <Animated.Text
-                      style={[styles.previewTimer, secondsAnimatedStyle]}
-                    >
-                      {timerSs}
-                    </Animated.Text>
-                  </View>
-                </View>
-              </View>
+              <PreviewCountdownTimer />
 
               <Text style={styles.previewLabel}>
                 Ticket Booking Date & Time
@@ -416,6 +484,11 @@ const styles = StyleSheet.create({
   headerRow: {
     alignItems: "center",
     flexDirection: "row",
+    justifyContent: "space-between",
+  },
+  headerLeft: {
+    alignItems: "center",
+    flexDirection: "row",
     gap: 12,
   },
   backButton: {
@@ -426,6 +499,12 @@ const styles = StyleSheet.create({
     height: 32,
     justifyContent: "center",
     width: 32,
+  },
+  shareButton: {
+    alignItems: "center",
+    height: 36,
+    justifyContent: "center",
+    width: 36,
   },
   headerTitle: {
     color: "#FFFFFF",
@@ -440,10 +519,13 @@ const styles = StyleSheet.create({
   content: {
     paddingBottom: 28,
     paddingHorizontal: 12,
-    paddingTop: 14,
+    // paddingTop: 14,
   },
   thankYou: {
-    color: "#AFA193",
+    color: "#413632",
+    backgroundColor: TICKET_PAPER,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
     fontFamily: "Poppins_500Medium",
     fontSize: 12,
     marginBottom: 12,
@@ -486,27 +568,44 @@ const styles = StyleSheet.create({
     alignItems: "center",
     flexDirection: "row",
     justifyContent: "center",
-    minHeight: 56,
+    minHeight: TIMER_DIGIT_HEIGHT,
   },
-  previewTimerSlot: {
+  previewTimerDigitSlot: {
     alignItems: "center",
-    height: 56,
+    height: TIMER_DIGIT_HEIGHT,
     justifyContent: "center",
-    minWidth: 58,
     overflow: "hidden",
+    width: TIMER_DIGIT_WIDTH,
   },
   previewTimerColon: {
     color: "#FF0000",
     fontFamily: "Poppins_800ExtraBold",
     fontSize: 44,
-    lineHeight: 50,
-    marginHorizontal: -2,
+    includeFontPadding: false,
+    lineHeight: TIMER_DIGIT_HEIGHT,
+    textAlign: "center",
+    width: 22,
   },
   previewTimer: {
     color: "#FF0000",
-    fontFamily: "Poppins_800ExtraBold",
+    fontFamily: "Poppins_700Bold",
     fontSize: 44,
-    lineHeight: 50,
+    lineHeight: TIMER_DIGIT_HEIGHT,
+  },
+  previewTimerDigitText: {
+    includeFontPadding: false,
+    textAlign: "center",
+    width: TIMER_DIGIT_WIDTH,
+  },
+  previewTimerDigitOverlay: {
+    alignItems: "center",
+    height: TIMER_DIGIT_HEIGHT,
+    justifyContent: "center",
+    left: 0,
+    position: "absolute",
+    right: 0,
+    top: 0,
+    width: TIMER_DIGIT_WIDTH,
   },
   previewLabel: {
     color: "#C7B2A8",
@@ -515,7 +614,7 @@ const styles = StyleSheet.create({
   },
   previewDate: {
     color: "#FF9F00",
-    fontFamily: "Poppins_700Bold",
+    fontFamily: "Poppins_500Medium",
     fontSize: 23,
     lineHeight: 30,
     marginTop: 3,
